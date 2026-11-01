@@ -20,8 +20,7 @@ const AppConfig = {
         
         // For deployed web version — served from same origin (Render)
         console.log('🌐 Web deployment detected — using same origin');
-        return window.location.origin;
-    },
+        return 'https://agrismart-api-m8nz.onrender.com';    },
     
     // Check if running as mobile app
     isMobileApp: function() {
