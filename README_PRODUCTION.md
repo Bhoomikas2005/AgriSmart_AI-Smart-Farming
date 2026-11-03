@@ -25,7 +25,7 @@
 - **Pest Prediction** - Early warning system for crop diseases
 - **Weather Intelligence** - 7-day forecast with farming insights
 - **Fertilizer Calculator** - Optimal NPK recommendations
-- **Market Prices** - Real-time mandi prices and forecasts
+- **Market Prices** - Official Agmarknet mandi prices when a data.gov.in API key is configured; otherwise clearly labeled reference estimates
 - **Crop Rotation Planner** - Sustainable farming schedules
 
 ### 👨‍🌾 Farmer-Friendly Design
@@ -154,14 +154,17 @@ agrismart-ai/
 ### Environment Variables
 ```env
 # Backend
-DATABASE_URL=sqlite:///database/sustainable_farming.db
+DATABASE_PATH=database/sustainable_farming.db
 API_HOST=127.0.0.1
 API_PORT=8001
 
 # Optional
 OPENWEATHER_API_KEY=your_api_key
 GOOGLE_TRANSLATE_API_KEY=your_api_key
+DATA_GOV_API_KEY=your_data_gov_in_api_key
 ```
+
+Get a data.gov.in API key to enable live prices from the official Agmarknet dataset. The price screens identify the data source and update date; if the feed is not configured or unavailable, they show an estimate warning instead of presenting generated values as live market quotes.
 
 ### PWA Installation
 1. Open the web app in Chrome

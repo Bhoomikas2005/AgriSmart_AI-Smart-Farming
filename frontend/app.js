@@ -2790,7 +2790,9 @@ async function generateMarketForecast() {
     const period = document.getElementById('forecast-period').value;
     showLoading('Generating market forecast...');
     try {
-        const data = await fetch(`${API}/market/dashboard?crop=${encodeURIComponent(crop)}&period=${period}%20months`).then(r => r.json());
+        const response = await fetch(`${API}/market/dashboard?crop=${encodeURIComponent(crop)}&period=${period}%20months`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Market data request failed');
         if (data.forecast?.length) {
             const months = data.forecast.map(f => f.month_name || f.month);
             const prices = data.forecast.map(f => f.price);
@@ -2812,15 +2814,16 @@ async function generateMarketForecast() {
         insEl.innerHTML = `<h3 class="card-title"><i class="fas fa-lightbulb"></i> Market Insights</h3>
             <ul style="padding-left:1.25rem;font-size:0.9rem;line-height:1.8">
                 <li><strong>Current Price:</strong> ₹${data.current_price?.toLocaleString()}/ton</li>
+                <li><strong>Price source:</strong> ${data.price_source || 'Unknown'}${data.last_updated ? ` (updated ${data.last_updated})` : ''}</li>
                 <li><strong>Predicted:</strong> ₹${data.predicted_price?.toLocaleString()}/ton</li>
                 <li><strong>Change:</strong> <span style="color:${data.price_change_percent >= 0 ? 'var(--farm-green)' : 'var(--farm-red)'}">${data.price_change_percent >= 0 ? '▲' : '▼'} ${Math.abs(data.price_change_percent)}%</span></li>
                 <li><strong>Recommendation:</strong> ${data.recommendation}</li>
                 <li>${data.analysis}</li>
-            </ul>`;
+            </ul>${data.data_warning ? `<p class="market-data-warning" role="status">${data.data_warning}</p>` : ''}`;
         if (state.language !== 'en') _translateAllTextIn(insEl, state.language);
         toast('Market forecast generated 📈', 'success');
-    } catch {
-        toast('Could not generate forecast', 'error');
+    } catch (error) {
+        toast(`Could not generate forecast: ${error.message}`, 'error');
     } finally {
         hideLoading();
     }
@@ -4477,8 +4480,10 @@ function renderMandiResults(data) {
                 <h3 style="color:${recColor}">${data.recommendation || 'ANALYZING'}</h3>
                 <p>${data.recommendation_reason || ''}</p>
                 <span class="mandi-best-time"><i class="fas fa-calendar"></i> ${data.best_time_to_sell || ''}</span>
+                <p class="mandi-price-source"><strong>Source:</strong> ${data.price_source || 'Unknown'}${data.last_updated ? ` · Updated ${data.last_updated}` : ''}</p>
             </div>
         </div>
+        ${data.data_warning ? `<div class="market-data-warning" role="status">${data.data_warning}</div>` : ''}
         
         <div class="mandi-price-cards animate-fade-in">
             <div class="mandi-price-card">
@@ -4496,17 +4501,17 @@ function renderMandiResults(data) {
                 <div class="mandi-pc-value">₹${cp.max || 0}</div>
                 <div class="mandi-pc-unit">${cp.unit || '/quintal'}</div>
             </div>
-            <div class="mandi-price-card msp-card">
+            ${data.msp?.price ? `<div class="mandi-price-card msp-card">
                 <div class="mandi-pc-label">MSP ${data.msp?.year || ''}</div>
                 <div class="mandi-pc-value">₹${data.msp?.price || 0}</div>
                 <div class="mandi-pc-unit">Govt. Support Price</div>
-            </div>
+            </div>` : ''}
         </div>
         
-        <div class="card mt-4 animate-fade-in">
+        ${data.price_history?.length ? `<div class="card mt-4 animate-fade-in">
             <h3 class="card-title"><i class="fas fa-chart-area"></i> Price History (6 months)</h3>
             <div id="mandi-price-chart" class="chart-container"></div>
-        </div>
+        </div>` : ''}
         
         <div class="card mt-4 animate-fade-in">
             <h3 class="card-title"><i class="fas fa-store-alt"></i> Top Mandis</h3>
@@ -4521,7 +4526,7 @@ function renderMandiResults(data) {
                                 <td class="mandi-price-cell">₹${m.price || 0}</td>
                                 <td>${m.arrival_tons ? m.arrival_tons + ' tons' : '-'}</td>
                             </tr>
-                        `).join('')}
+                        `).join('') || '<tr><td colspan="4">No verified mandi listings available.</td></tr>'}
                     </tbody>
                 </table>
             </div>

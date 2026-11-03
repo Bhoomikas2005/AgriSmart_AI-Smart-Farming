@@ -17,8 +17,11 @@ Groq API agents validate, enrich, and provide detailed analysis — they do NOT 
 """
 
 import os
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from models.farmer_advisor import FarmerAdvisor
 from models.market_Researcher import MarketResearcher
@@ -32,7 +35,7 @@ try:
     from models.custom_engine import AgriSmartEngine
     HAS_CUSTOM_ENGINE = True
 except Exception as _e:
-    print(f"⚠️ Custom engine unavailable: {_e}")
+    logger.warning("Custom engine unavailable: %s", _e)
     HAS_CUSTOM_ENGINE = False
 
 

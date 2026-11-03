@@ -1,17 +1,17 @@
 // AgriSmart AI - Service Worker for Offline Support
-// Version: 8.0.0 - Production UI Overhaul: Auth, Header, Footer, Sidebar, Animations
+// Version: 8.0.2 - Market data source and estimate labeling
 
-const CACHE_NAME = 'agrismart-v8.0.0';
+const CACHE_NAME = 'agrismart-v8.0.2';
 const OFFLINE_URL = './index.html';
 
 // Files to cache for offline use
 const STATIC_ASSETS = [
     './',
     './index.html',
-    './styles_modern.css',
+    './styles_modern.css?v=8.0.2',
     './mobile-styles.css',
     './voice-styles.css',
-    './app.js',
+    './app.js?v=8.0.2',
     './config.js',
     './manifest.json',
     './icons/icon.svg'

@@ -4,6 +4,8 @@ import os
 import io
 import sys
 import sqlite3
+import logging
+import statistics
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Query
@@ -16,6 +18,11 @@ import base64
 import random
 import requests
 from PIL import Image
+from dotenv import load_dotenv
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
+logger = logging.getLogger(__name__)
 
 # Deep Translator for dynamic multilingual translation
 try:
@@ -192,13 +199,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'database/sustainable_farming.db'))
-# Also check parent directory for database
-if not os.path.exists(os.path.dirname(DB_PATH)):
-    DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'database', 'sustainable_farming.db'))
+configured_db_path = os.getenv("DATABASE_PATH")
+if configured_db_path:
+    DB_PATH = configured_db_path
+    if not os.path.isabs(DB_PATH):
+        DB_PATH = os.path.join(PROJECT_ROOT, DB_PATH)
+else:
+    DB_PATH = os.path.join(PROJECT_ROOT, 'database', 'sustainable_farming.db')
+
+if os.path.isfile(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+    with open(DB_PATH, 'rb') as db_file:
+        is_sqlite_database = db_file.read(16) == b'SQLite format 3\x00'
+    if not is_sqlite_database:
+        logger.warning(
+            "Database file %s is not a SQLite database; using a local runtime database instead.",
+            DB_PATH,
+        )
+        DB_PATH = os.path.join(PROJECT_ROOT, 'database', 'sustainable_farming.runtime.db')
 
 # Open-Meteo API — free, no API key required
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+AGMARKNET_API_URL = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
+DATA_GOV_API_KEY = os.getenv("DATA_GOV_API_KEY", "").strip()
 
 # Models
 class UserSignup(BaseModel):
@@ -667,7 +689,7 @@ try:
     from models.central_coordinator import CentralCoordinator
     MODELS_AVAILABLE = True
 except ImportError as e:
-    print(f"⚠️ Could not import ML models: {e}")
+    logger.warning("Could not import ML models: %s", e)
     MODELS_AVAILABLE = False
 
 @app.post("/multi_agent_recommendation")
@@ -1322,57 +1344,251 @@ def get_my_community_posts(username: str = Query(...)):
         })
     return {"posts": posts}
 
+def _fetch_agmarknet_records(crop: str, state: str = ""):
+    if not DATA_GOV_API_KEY:
+        return [], "Live mandi prices require a DATA_GOV_API_KEY. Showing an indicative estimate instead."
+
+    params = {
+        "api-key": DATA_GOV_API_KEY,
+        "format": "json",
+        "filters[commodity]": crop,
+        "limit": 1000,
+    }
+    if state:
+        params["filters[state]"] = state
+
+    try:
+        response = requests.get(AGMARKNET_API_URL, params=params, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Agmarknet price request failed for %s (%s).", crop, type(exc).__name__)
+        return [], "Live mandi prices are temporarily unavailable. Showing an indicative estimate instead."
+
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    if not isinstance(records, list) or not records:
+        return [], "No Agmarknet prices were found for this crop and location. Showing an indicative estimate instead."
+    return records, ""
+
+
+def _market_number(record: dict, field: str):
+    value = next((value for key, value in record.items() if key.lower() == field), None)
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_date(record: dict):
+    value = next(
+        (value for key, value in record.items() if key.lower() == "arrival_date"),
+        None,
+    )
+    if not value:
+        return None
+    for date_format in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(str(value), date_format)
+        except ValueError:
+            continue
+    return None
+
+
+def _build_live_mandi_data(crop: str, state: str = ""):
+    raw_records, warning = _fetch_agmarknet_records(crop, state)
+    normalized_records = []
+    for record in raw_records:
+        if not isinstance(record, dict):
+            continue
+        modal = _market_number(record, "modal_price")
+        minimum = _market_number(record, "min_price")
+        maximum = _market_number(record, "max_price")
+        arrival_date = _market_date(record)
+        if modal is None or minimum is None or maximum is None or arrival_date is None:
+            continue
+        normalized_records.append({
+            "state": next((value for key, value in record.items() if key.lower() == "state"), ""),
+            "district": next((value for key, value in record.items() if key.lower() == "district"), ""),
+            "market": next((value for key, value in record.items() if key.lower() == "market"), ""),
+            "modal": modal,
+            "min": minimum,
+            "max": maximum,
+            "date": arrival_date,
+        })
+
+    if not normalized_records:
+        if raw_records:
+            return None, "Agmarknet returned no usable price records. Showing an indicative estimate instead."
+        return None, warning
+
+    latest_date = max(record["date"] for record in normalized_records)
+    latest_records = [record for record in normalized_records if record["date"] == latest_date]
+    modal_price = statistics.median(record["modal"] for record in latest_records)
+    monthly_prices = {}
+    for record in normalized_records:
+        month = record["date"].strftime("%Y-%m")
+        monthly_prices.setdefault(month, []).append(record["modal"])
+    price_history = [
+        {
+            "month": datetime.strptime(month, "%Y-%m").strftime("%b %Y"),
+            "price": round(statistics.mean(prices), 2),
+        }
+        for month, prices in sorted(monthly_prices.items())[-6:]
+    ]
+
+    monthly_change = 0.0
+    if len(price_history) > 1 and price_history[-2]["price"]:
+        monthly_change = (price_history[-1]["price"] - price_history[-2]["price"]) / price_history[-2]["price"]
+    trend = "rising" if monthly_change > 0.01 else "falling" if monthly_change < -0.01 else "stable"
+    latest_records.sort(key=lambda record: record["modal"], reverse=True)
+
+    return {
+        "crop": crop,
+        "current_price": {
+            "min": round(min(record["min"] for record in latest_records), 2),
+            "max": round(max(record["max"] for record in latest_records), 2),
+            "modal": round(modal_price, 2),
+            "unit": "₹/quintal",
+        },
+        "msp": None,
+        "price_trend": trend,
+        "price_forecast_7d": {
+            "predicted": round(modal_price * (1 + monthly_change * 7 / 30), 2),
+            "confidence": 0.4 if len(price_history) > 1 else 0.2,
+        },
+        "price_forecast_30d": {
+            "predicted": round(modal_price * (1 + monthly_change), 2),
+            "confidence": 0.4 if len(price_history) > 1 else 0.2,
+        },
+        "top_mandis": [
+            {
+                "name": record["market"],
+                "state": record["state"],
+                "price": round(record["modal"], 2),
+                "arrival_tons": None,
+            }
+            for record in latest_records[:5]
+        ],
+        "recommendation": "REVIEW MARKET",
+        "recommendation_reason": "Compare today's published mandi prices with local buyer offers before selling.",
+        "best_time_to_sell": "Review current local bids; this feed does not provide a sell/hold recommendation.",
+        "storage_advice": "Use clean, dry, pest-safe storage if you choose to hold the crop.",
+        "market_insights": [
+            f"Official Agmarknet prices last updated {latest_date.strftime('%d %b %Y')}.",
+            "Prices vary by market, variety, quality, and arrival volume.",
+        ],
+        "nearby_mandis": [],
+        "price_history": price_history,
+        "price_source": "Agmarknet (data.gov.in)",
+        "last_updated": latest_date.strftime("%Y-%m-%d"),
+        "data_warning": "",
+    }, ""
+
+
+def _build_estimated_mandi_data(crop: str, warning: str):
+    base_prices = {
+        "rice": 2200, "wheat": 2275, "maize": 2090, "corn": 2090,
+        "cotton": 6620, "soybean": 4600, "sugarcane": 315,
+        "potato": 1500, "onion": 2000, "tomato": 2500, "mustard": 5650,
+        "groundnut": 6377, "jowar": 3180, "bajra": 2500, "ragi": 3846,
+        "chana": 5440, "tur": 7000, "moong": 8558, "urad": 6950,
+    }
+    base_price = base_prices.get(crop.lower().strip(), 3000)
+    return {
+        "crop": crop,
+        "current_price": {
+            "min": round(base_price * 0.9),
+            "max": round(base_price * 1.1),
+            "modal": base_price,
+            "unit": "₹/quintal",
+        },
+        "msp": None,
+        "price_trend": "stable",
+        "price_forecast_7d": {"predicted": base_price, "confidence": 0},
+        "price_forecast_30d": {"predicted": base_price, "confidence": 0},
+        "top_mandis": [],
+        "recommendation": "VERIFY LOCALLY",
+        "recommendation_reason": "This is a reference estimate, not a live mandi quote. Check the latest local market price before making a sale.",
+        "best_time_to_sell": "No live price data is available for a sell/hold recommendation.",
+        "storage_advice": "Use clean, dry, pest-safe storage if you choose to hold the crop.",
+        "market_insights": [],
+        "nearby_mandis": [],
+        "price_history": [],
+        "price_source": "Indicative estimate (not a live market quote)",
+        "last_updated": None,
+        "data_warning": warning,
+    }
+
 @app.get("/market/dashboard")
 def market_dashboard(crop: str = Query("Rice"), period: str = Query("3 months")):
     months = 3 if '3' in period else 6 if '6' in period else 12
-    
-    # Base prices from real market data (approximate Indian market prices in ₹/ton)
+    live_data, warning = _build_live_mandi_data(crop)
+    if live_data:
+        base_price = live_data["current_price"]["modal"] * 10
+        trend = live_data["price_trend"]
+        trend_factor = 1.01 if trend == "rising" else 0.99 if trend == "falling" else 1.0
+        forecast = []
+        current_month = datetime.now().month
+        current_price = base_price
+        for i in range(months):
+            current_price *= trend_factor
+            month = (current_month + i) % 12 + 1
+            forecast.append({
+                "month": f"Month {i + 1}",
+                "month_name": datetime(datetime.now().year, month, 1).strftime("%B"),
+                "price": round(current_price, 2),
+                "confidence": max(0.2, 0.4 - i * 0.03),
+                "trend": "up" if trend == "rising" else "down" if trend == "falling" else "stable",
+            })
+        price_change = ((forecast[-1]["price"] - base_price) / base_price) * 100
+        return {
+            "crop": crop,
+            "forecast": forecast,
+            "current_price": round(base_price, 2),
+            "predicted_price": round(forecast[-1]["price"], 2),
+            "price_change_percent": round(price_change, 1),
+            "recommendation": "Monitor market; forecast is trend-based, not a guarantee.",
+            "analysis": f"Latest Agmarknet modal price is ₹{live_data['current_price']['modal']:.2f}/quintal ({live_data['last_updated']}).",
+            "price_source": live_data["price_source"],
+            "last_updated": live_data["last_updated"],
+            "data_warning": "",
+        }
+
     base_prices = {
-        "Rice": 25000, "Wheat": 22000, "Corn": 18000, "Soybean": 40000,
+        "Rice": 25000, "Wheat": 22000, "Corn": 18000, "Maize": 18000, "Soybean": 40000,
         "Tomato": 15000, "Potato": 12000, "Cotton": 55000, "Groundnut": 45000,
         "Sugarcane": 3000, "Onion": 20000
     }
-    
     base_price = base_prices.get(crop, 20000)
-    
-    # Generate realistic forecast with seasonal variations
     forecast = []
     current_price = base_price
     current_month = datetime.now().month
     
     for i in range(months):
-        # Seasonal factor
         month = (current_month + i - 1) % 12 + 1
         seasonal_factor = 1.0
         if crop in ["Tomato", "Onion", "Potato"]:
-            # Vegetables have higher seasonal variation
             if month in [4, 5, 6]:  # Summer
                 seasonal_factor = 1.15
             elif month in [7, 8, 9]:  # Monsoon
                 seasonal_factor = 0.85
         elif crop in ["Rice", "Wheat"]:
-            # Grains have harvest-related price dips
             if month in [10, 11]:  # Harvest season
                 seasonal_factor = 0.92
         
-        # Random market fluctuation (-5% to +8%)
-        market_factor = random.uniform(0.95, 1.08)
-        
-        current_price = current_price * seasonal_factor * market_factor
-        confidence = max(0.6, 0.95 - (i * 0.03))  # Decreasing confidence
+        current_price *= seasonal_factor
+        confidence = 0.2
         
         forecast.append({
             "month": f"Month {i+1}",
             "month_name": datetime(2024, month, 1).strftime("%B"),
             "price": round(current_price, 2),
             "confidence": round(confidence, 2),
-            "trend": "up" if market_factor > 1 else "down"
+            "trend": "up" if seasonal_factor > 1 else "down" if seasonal_factor < 1 else "stable"
         })
     
-    # Calculate insights
-    start_price = forecast[0]["price"]
     end_price = forecast[-1]["price"]
-    price_change = ((end_price - start_price) / start_price) * 100
+    price_change = ((end_price - base_price) / base_price) * 100
     
     return {
         "crop": crop,
@@ -1380,8 +1596,11 @@ def market_dashboard(crop: str = Query("Rice"), period: str = Query("3 months"))
         "current_price": base_price,
         "predicted_price": round(end_price, 2),
         "price_change_percent": round(price_change, 1),
-        "recommendation": "Good time to plant" if price_change > 5 else "Monitor market" if price_change > -5 else "Consider alternatives",
-        "analysis": f"{crop} prices expected to {'increase' if price_change > 0 else 'decrease'} by {abs(price_change):.1f}% over {period}"
+        "recommendation": "Estimate only — verify current local prices.",
+        "analysis": "No live feed is configured; this is a seasonal reference estimate, not a market forecast.",
+        "price_source": "Indicative estimate (not a live market quote)",
+        "last_updated": None,
+        "data_warning": warning,
     }
 
 def generate_chatbot_response(query):
@@ -1893,74 +2112,12 @@ List all eligible central and state government schemes with application details.
 
 @app.post("/mandi_prices")
 def get_mandi_prices(req: MandiPriceRequest):
-    """AI-powered mandi price analysis with buy/sell recommendations"""
+    """Return official mandi data when available, otherwise a clearly labeled estimate."""
     try:
-        from models.llm_config import call_gemini
-        
-        system_prompt = """You are an expert Indian agricultural market analyst specializing in mandi prices.
-Provide current market price analysis for the requested crop.
-Return JSON with:
-{
-  "crop": "Crop name",
-  "current_price": {"min": 0, "max": 0, "modal": 0, "unit": "₹/quintal"},
-  "msp": {"price": 0, "year": "2024-25"},
-  "price_trend": "rising|stable|falling",
-  "price_forecast_7d": {"predicted": 0, "confidence": 0.0},
-  "price_forecast_30d": {"predicted": 0, "confidence": 0.0},
-  "top_mandis": [
-    {"name": "Mandi Name", "state": "State", "price": 0, "arrival_tons": 0}
-  ],
-  "recommendation": "SELL|HOLD|WAIT",
-  "recommendation_reason": "Detailed reasoning",
-  "best_time_to_sell": "Suggested timeframe",
-  "storage_advice": "Storage tips if holding",
-  "market_insights": ["Key market factors"],
-  "nearby_mandis": [{"name": "Mandi", "distance_km": 0, "price": 0}],
-  "price_history": [
-    {"month": "Month", "price": 0}
-  ]
-}
-Use realistic Indian mandi prices. Generate 6-month price history."""
-        
-        user_prompt = f"""Analyze mandi prices for:
-Crop: {req.crop}
-State/Region: {req.state or 'Pan India'}
-District: {req.district or 'All districts'}
-
-Provide current prices, forecasts, top mandis, and sell/hold recommendation."""
-
-        result = call_gemini(system_prompt, user_prompt, temperature=0.3, max_tokens=3000, json_mode=True)
-        
+        result, warning = _build_live_mandi_data(req.crop, req.state)
         if not result:
-            # Smart fallback with realistic prices
-            import random
-            base_prices = {"rice": 2200, "wheat": 2275, "maize": 2090, "cotton": 6620, "soybean": 4600, "sugarcane": 315, "potato": 1500, "onion": 2000, "tomato": 2500, "mustard": 5650, "groundnut": 6377, "jowar": 3180, "bajra": 2500, "ragi": 3846, "chana": 5440, "tur": 7000, "moong": 8558, "urad": 6950}
-            crop_lower = req.crop.lower().strip()
-            base = base_prices.get(crop_lower, 3000)
-            modal = base + random.randint(-200, 200)
-            result = {
-                "crop": req.crop,
-                "current_price": {"min": modal - 300, "max": modal + 500, "modal": modal, "unit": "₹/quintal"},
-                "msp": {"price": base, "year": "2024-25"},
-                "price_trend": random.choice(["rising", "stable", "falling"]),
-                "price_forecast_7d": {"predicted": modal + random.randint(-100, 200), "confidence": 0.75},
-                "price_forecast_30d": {"predicted": modal + random.randint(-300, 500), "confidence": 0.60},
-                "top_mandis": [
-                    {"name": "Azadpur Mandi", "state": "Delhi", "price": modal + 200, "arrival_tons": 5000},
-                    {"name": "Vashi APMC", "state": "Maharashtra", "price": modal + 100, "arrival_tons": 3500},
-                    {"name": "Yeshwanthpur", "state": "Karnataka", "price": modal - 50, "arrival_tons": 2800},
-                    {"name": "Koyambedu", "state": "Tamil Nadu", "price": modal + 50, "arrival_tons": 2200},
-                    {"name": "Bowenpally", "state": "Telangana", "price": modal + 80, "arrival_tons": 1800}
-                ],
-                "recommendation": "HOLD" if modal < base else "SELL",
-                "recommendation_reason": f"Current modal price ₹{modal}/quintal vs MSP ₹{base}/quintal",
-                "best_time_to_sell": "Within next 2 weeks" if modal >= base else "Wait 3-4 weeks for better prices",
-                "storage_advice": "Store in cool, dry place. Use hermetic bags for grains.",
-                "market_insights": ["Festival season may increase demand", "Good monsoon expected to increase supply", "Export demand remains strong"],
-                "nearby_mandis": [],
-                "price_history": [{"month": m, "price": base + random.randint(-400, 400)} for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]]
-            }
-        
+            result = _build_estimated_mandi_data(req.crop, warning)
+
         # Save to DB
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()

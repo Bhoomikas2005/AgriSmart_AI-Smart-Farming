@@ -9,3 +9,7 @@ LLAMA_MODEL_PATH=meta-llama/Llama-2-7b-chat-hf
 
 # Database Configuration
 DATABASE_PATH=database/sustainable_farming.db
+
+# Optional: data.gov.in API key for live Agmarknet mandi prices
+# Without this key, price screens display clearly labeled reference estimates.
+DATA_GOV_API_KEY=your_data_gov_in_api_key_here

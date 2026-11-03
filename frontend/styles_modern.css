@@ -4528,6 +4528,21 @@ body.simple-mode .card-title {
     color: #64748b;
 }
 
+.mandi-price-source {
+    font-size: 0.8rem !important;
+    color: #64748b !important;
+}
+
+.market-data-warning {
+    padding: 0.85rem 1rem;
+    margin: 0.75rem 0;
+    border: 1px solid #fed7aa;
+    border-radius: 12px;
+    background: #fff7ed;
+    color: #9a3412;
+    font-size: 0.9rem;
+}
+
 .mandi-price-cards {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
